@@ -162,6 +162,12 @@ def get_current_branch() -> str | None:
     return run_git("branch", "--show-current")
 
 
+def is_worktree_dirty(worktree_path: Path) -> bool:
+    """Check if a worktree has uncommitted changes."""
+    result = run_git("status", "--porcelain", cwd=worktree_path)
+    return bool(result and result.strip())
+
+
 def list_worktrees(repo_root: Path) -> list[WorktreeInfo]:
     """List all worktrees for the repository."""
     result = run_git("worktree", "list", "--porcelain", cwd=repo_root)
@@ -295,12 +301,79 @@ def format_branch_option(branch: str) -> str:
     return click.style(branch, fg=GREEN)
 
 
+def fetch_origin(repo_root: Path) -> bool:
+    """Fetch from origin. Returns True on success."""
+    click.echo(style_info("Fetching from origin..."))
+    result = subprocess.run(
+        ["git", "fetch", "origin"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def prompt_base_branch(repo_root: Path) -> str | None:
+    """Prompt for base branch: main (default), HEAD, or pick a branch."""
+    # Fetch to ensure we have latest remote state
+    fetch_origin(repo_root)
+
+    default_branch = get_default_branch(repo_root)
+    branches = list_branches(repo_root, include_remote=False)
+
+    # Build options: default branch first, then HEAD, then "Pick..."
+    base_options = [f"{default_branch} (default)", "HEAD (current)"]
+    if branches:
+        base_options.append("Pick a branch...")
+
+    index = fuzzy_select(base_options, "Branch from")
+    if index is None:
+        return None
+
+    if index == 0:
+        # Use remote version of default branch for latest commits
+        return f"origin/{default_branch}"
+    elif index == 1:
+        return "HEAD"
+    else:
+        # Pick from all branches (includes remotes)
+        all_branches = list_branches(repo_root)
+        return select_from_menu("Select base branch", all_branches)
+
+
+def prompt_fork_base(repo_root: Path) -> str | None:
+    """Prompt for fork base: HEAD (default), main, or pick a branch."""
+    default_branch = get_default_branch(repo_root)
+    branches = list_branches(repo_root, include_remote=False)
+
+    # Build options: HEAD first (default for fork), then main, then "Pick..."
+    base_options = ["HEAD (current)", f"{default_branch}"]
+    if branches:
+        base_options.append("Pick a branch...")
+
+    index = fuzzy_select(base_options, "Branch from")
+    if index is None:
+        return None
+
+    if index == 0:
+        return "HEAD"
+    elif index == 1:
+        # Fetch and use remote version for latest commits
+        fetch_origin(repo_root)
+        return f"origin/{default_branch}"
+    else:
+        # Pick from all branches (includes remotes)
+        fetch_origin(repo_root)
+        all_branches = list_branches(repo_root)
+        return select_from_menu("Select base branch", all_branches)
+
+
 def select_branch_interactive(repo_root: Path) -> tuple[str, bool] | None:
     """Interactive branch selection. Returns (branch_name, is_new_branch) or None."""
     branches = list_branches(repo_root)
 
-    # Special options at the top
-    special_opts = ["[+] Create new branch", "[+] Create new branch from..."]
+    # Special option at the top
+    special_opts = ["[+] Create new branch"]
     options = special_opts + branches
 
     index = fuzzy_select(options, "Select branch")
@@ -311,15 +384,13 @@ def select_branch_interactive(repo_root: Path) -> tuple[str, bool] | None:
         branch_name = click.prompt(
             click.style("  New branch name", fg=CYAN), prompt_suffix=" → "
         )
-        return (branch_name, True)
-    elif index == 1:  # Create new branch from...
-        base = select_from_menu("Select base branch", branches)
+        base = prompt_base_branch(repo_root)
         if not base:
             return None
-        branch_name = click.prompt(
-            click.style("  New branch name", fg=CYAN), prompt_suffix=" → "
-        )
-        run_git("branch", branch_name, base, cwd=repo_root)
+        # Create branch from selected base
+        if base != "HEAD":
+            run_git("branch", branch_name, base, cwd=repo_root)
+            return (branch_name, False)  # Branch exists now, no need for -b
         return (branch_name, True)
     else:
         # Return actual branch name
@@ -502,45 +573,44 @@ def pr(name: str | None) -> None:
 
 
 @cli.command()
-@click.argument("name")
-def fork(name: str) -> None:
-    """Create worktree from current branch.
+@click.argument("name", required=False)
+def fork(name: str | None) -> None:
+    """Create worktree with a new branch.
 
-    Creates a new worktree with a new branch based on current HEAD.
+    Prompts for branch name, then base branch (defaults to current HEAD).
     """
     repo_root = require_repo()
 
-    current = get_current_branch()
-    if not current:
-        click.echo(style_error("Not on a branch (detached HEAD?)"), err=True)
-        sys.exit(1)
-
-    click.echo(style_info(f"Forking from branch '{current}'"))
-
-    # Create new branch name
+    # Prompt for new branch name
     new_branch = click.prompt(
         click.style("  New branch name", fg=CYAN),
-        default=name,
         prompt_suffix=" → ",
     )
 
-    worktree_path = get_worktree_path(repo_root, name)
-    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    # Prompt for base branch (default to HEAD)
+    base = prompt_fork_base(repo_root)
+    if not base:
+        click.echo(style_dim("Cancelled."))
+        return
 
-    result = subprocess.run(
-        ["git", "worktree", "add", "-b", new_branch, str(worktree_path)],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+    # Prompt for worktree name
+    if not name:
+        suggested = new_branch.replace("/", "-")
+        name = click.prompt(
+            click.style("  Worktree name", fg=CYAN),
+            default=suggested,
+            prompt_suffix=" → ",
+        )
 
-    if result.returncode == 0:
-        click.echo(style_success(f"Created worktree '{name}'"))
-        click.echo(style_dim(f"  Branch: {new_branch}"))
-        click.echo(style_dim(f"  Path: {worktree_path}"))
-        output_cd(worktree_path)
+    # Create branch from base if not HEAD
+    if base != "HEAD":
+        run_git("branch", new_branch, base, cwd=repo_root)
+        worktree_path = create_worktree(repo_root, name, new_branch, new_branch=False)
     else:
-        click.echo(style_error(f"Failed: {result.stderr}"), err=True)
+        worktree_path = create_worktree(repo_root, name, new_branch, new_branch=True)
+
+    if worktree_path:
+        output_cd(worktree_path)
 
 
 @cli.command("list")
@@ -613,6 +683,46 @@ def switch_cmd(name: str | None) -> None:
     output_cd(selected.path)
 
 
+def do_remove_worktree(
+    repo_root: Path, name: str, worktree_path: Path, *, force: bool = False
+) -> bool:
+    """Remove a worktree with dirty check and cd-back logic. Returns True on success."""
+    # Check if we're in the worktree being removed
+    cwd = Path.cwd().resolve()
+    in_removed_worktree = cwd == worktree_path.resolve() or str(cwd).startswith(
+        str(worktree_path.resolve()) + os.sep
+    )
+
+    # Check if dirty and prompt if needed
+    if not force and is_worktree_dirty(worktree_path):
+        if not click.confirm(
+            style_warn(f"Worktree '{name}' has uncommitted changes. Remove anyway?"),
+            default=False,
+        ):
+            click.echo(style_dim("Cancelled."))
+            return False
+        force = True
+
+    args = ["worktree", "remove"]
+    if force:
+        args.append("--force")
+    args.append(str(worktree_path))
+
+    result = subprocess.run(
+        ["git", *args], cwd=repo_root, capture_output=True, text=True
+    )
+
+    if result.returncode == 0:
+        click.echo(style_success(f"Removed worktree '{name}'"))
+        # Switch back to main repo if we were in the removed worktree
+        if in_removed_worktree:
+            output_cd(repo_root)
+        return True
+    else:
+        click.echo(style_error(f"Failed to remove: {result.stderr}"), err=True)
+        return False
+
+
 @cli.command()
 @click.argument("name", required=False)
 @click.option("-f", "--force", is_flag=True, help="Force remove even if dirty")
@@ -660,19 +770,7 @@ def remove(name: str | None, *, force: bool) -> None:
             )
             sys.exit(1)
 
-    args = ["worktree", "remove"]
-    if force:
-        args.append("--force")
-    args.append(str(worktree_path))
-
-    result = subprocess.run(
-        ["git", *args], cwd=repo_root, capture_output=True, text=True
-    )
-
-    if result.returncode == 0:
-        click.echo(style_success(f"Removed worktree '{name}'"))
-    else:
-        click.echo(style_error(f"Failed to remove: {result.stderr}"), err=True)
+    if not do_remove_worktree(repo_root, name, worktree_path, force=force):
         sys.exit(1)
 
 
@@ -783,6 +881,7 @@ _wt() {
                 'ls:List all worktrees (alias)'
                 'remove:Remove a worktree'
                 'rm:Remove a worktree (alias)'
+                'cleanup:Remove the current worktree'
                 'claude:Open Claude Code in a worktree'
                 'c:Open Claude Code in a worktree (alias)'
                 'path:Print the path to a worktree'
@@ -843,7 +942,7 @@ _wt_completions() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="create cr switch sw pr fork fk list ls remove rm claude c path install"
+    commands="create cr switch sw pr fork fk list ls remove rm cleanup claude c path install"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -932,6 +1031,79 @@ def install(shell: str, *, print_only: bool) -> None:
     click.echo(style_dim(f"  Restart your shell or run: {source_cmd}"))
     if copy_to_clipboard(source_cmd):
         click.echo(style_dim("  (copied to clipboard)"))
+
+
+@cli.command()
+def cleanup() -> None:
+    """Remove the current worktree.
+
+    Prompts for confirmation, checks for uncommitted changes,
+    and switches back to the main repo after removal.
+    """
+    repo_root = require_repo()
+    cwd = Path.cwd().resolve()
+
+    # Find which worktree we're in
+    worktrees = list_worktrees(repo_root)
+    current_wt: WorktreeInfo | None = None
+
+    for wt in worktrees:
+        if wt.is_bare:
+            continue
+        wt_path = wt.path.resolve()
+        if cwd == wt_path or str(cwd).startswith(str(wt_path) + os.sep):
+            current_wt = wt
+            break
+
+    if current_wt is None:
+        click.echo(style_error("Not in a worktree."), err=True)
+        sys.exit(1)
+
+    # Check if in main repo
+    if current_wt.path.resolve() == repo_root.resolve():
+        click.echo(style_error("Cannot cleanup the main repository."), err=True)
+        sys.exit(1)
+
+    # Confirm removal
+    if not click.confirm(
+        style_warn(f"Remove current worktree '{current_wt.name}'?"), default=False
+    ):
+        click.echo(style_dim("Cancelled."))
+        return
+
+    branch_to_delete = current_wt.branch
+
+    if not do_remove_worktree(repo_root, current_wt.name, current_wt.path):
+        sys.exit(1)
+
+    # Offer to delete the branch
+    if branch_to_delete:
+        if click.confirm(
+            style_warn(f"Delete branch '{branch_to_delete}'?"), default=False
+        ):
+            result = run_git("branch", "-d", branch_to_delete, cwd=repo_root)
+            if result is not None:
+                click.echo(style_success(f"Deleted branch '{branch_to_delete}'"))
+            else:
+                # Try force delete if normal delete fails
+                if click.confirm(
+                    style_warn(
+                        f"Branch '{branch_to_delete}' is not fully merged. Force delete?"
+                    ),
+                    default=False,
+                ):
+                    result = run_git("branch", "-D", branch_to_delete, cwd=repo_root)
+                    if result is not None:
+                        click.echo(
+                            style_success(f"Force deleted branch '{branch_to_delete}'")
+                        )
+                    else:
+                        click.echo(
+                            style_error(
+                                f"Failed to delete branch '{branch_to_delete}'"
+                            ),
+                            err=True,
+                        )
 
 
 # Short aliases for frequently used commands
