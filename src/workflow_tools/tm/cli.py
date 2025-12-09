@@ -1,0 +1,445 @@
+"""Tmux session manager with git-aware naming and interactive selection UI."""
+
+from __future__ import annotations
+
+import os
+import socket
+import subprocess
+import sys
+from typing import NamedTuple
+
+import click
+
+from workflow_tools.common import (
+    CYAN,
+    DIM,
+    GREEN,
+    YELLOW,
+    fuzzy_select,
+    get_current_branch,
+    style_dim,
+    style_error,
+    style_info,
+    style_success,
+    style_warn,
+)
+
+# Number of fields in tmux session format string
+_SESSION_FORMAT_FIELDS = 3
+
+
+class SessionInfo(NamedTuple):
+    """Information about a tmux session."""
+
+    name: str
+    attached: bool
+    windows: int
+
+
+def get_hostname() -> str:
+    """Get the hostname for terminal title."""
+    return socket.gethostname().split(".")[0]
+
+
+def get_suggested_name() -> str:
+    """Get suggested session name from current branch or hostname."""
+    branch = get_current_branch()
+    if branch:
+        # Sanitize branch name: replace / with -
+        return branch.replace("/", "-")
+    return get_hostname()
+
+
+def is_tmux_installed() -> bool:
+    """Check if tmux is installed."""
+    result = subprocess.run(
+        ["which", "tmux"], capture_output=True, check=False, text=True
+    )
+    return result.returncode == 0
+
+
+def list_sessions() -> list[SessionInfo]:
+    """List all tmux sessions."""
+    result = subprocess.run(
+        [
+            "tmux",
+            "list-sessions",
+            "-F",
+            "#{session_name}:#{session_attached}:#{session_windows}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        # No server running or other error
+        return []
+
+    sessions: list[SessionInfo] = []
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split(":")
+        if len(parts) >= _SESSION_FORMAT_FIELDS:
+            sessions.append(
+                SessionInfo(
+                    name=parts[0],
+                    attached=parts[1] == "1",
+                    windows=int(parts[2]) if parts[2].isdigit() else 0,
+                )
+            )
+    return sessions
+
+
+def session_exists(name: str) -> bool:
+    """Check if a session with the given name exists."""
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", name],
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def set_terminal_title(session_name: str) -> None:
+    """Print escape sequence to set terminal title."""
+    hostname = get_hostname()
+    title = f"{hostname}-{session_name}"
+    # Print escape sequence to set terminal title
+    sys.stdout.write(f"\033]0;{title}\a")
+    sys.stdout.flush()
+
+
+def run_tmux_attach(session_name: str) -> None:
+    """Attach to a tmux session, replacing current process."""
+    set_terminal_title(session_name)
+    # Use exec to replace current process with tmux
+    os.execlp("tmux", "tmux", "attach-session", "-t", session_name)
+
+
+def run_tmux_new(session_name: str) -> None:
+    """Create and attach to a new tmux session, replacing current process."""
+    set_terminal_title(session_name)
+    # Use exec to replace current process with tmux
+    os.execlp("tmux", "tmux", "new-session", "-s", session_name)
+
+
+def format_session_option(session: SessionInfo) -> str:
+    """Format a session for display in picker."""
+    name_styled = click.style(session.name, fg=CYAN, bold=True)
+    if session.attached:
+        status = click.style("[attached]", fg=GREEN)
+    else:
+        status = click.style("[detached]", fg=YELLOW)
+    windows = click.style(f"({session.windows} windows)", fg=DIM)
+    return f"{name_styled} {status} {windows}"
+
+
+def require_tmux() -> None:
+    """Exit with error if tmux is not installed."""
+    if not is_tmux_installed():
+        click.echo(style_error("tmux is not installed"), err=True)
+        sys.exit(1)
+
+
+# CLI Commands
+
+
+@click.group(invoke_without_command=True)
+@click.version_option(package_name="workflow-tools")
+@click.pass_context
+def cli(ctx: click.Context) -> None:
+    """Tmux session manager with git-aware naming.
+
+    EXAMPLES:
+        tm                  # Smart default: attach or show picker/menu
+        tm create           # Create session (defaults to branch name)
+        tm attach           # Interactive: pick session to attach
+        tm list             # List all sessions
+        tm kill             # Interactive: pick session to kill
+
+    ALIASES:
+        tm c  = tm create
+        tm a  = tm attach
+        tm ls = tm list
+        tm k  = tm kill
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(default_cmd)
+
+
+@cli.command("default", hidden=True)
+def default_cmd() -> None:
+    """Smart default behavior."""
+    require_tmux()
+
+    # Get current branch name
+    suggested = get_suggested_name()
+    sessions = list_sessions()
+
+    # If matching session exists, auto-attach
+    matching = [s for s in sessions if s.name == suggested]
+    if matching:
+        click.echo(style_info(f"Attaching to session '{suggested}'..."))
+        run_tmux_attach(suggested)
+        return
+
+    # If sessions exist, show picker
+    if sessions:
+        options = [format_session_option(s) for s in sessions]
+        # Add create option at the top
+        create_opt = click.style("[+] Create new session", fg=GREEN)
+        options.insert(0, create_opt)
+
+        index = fuzzy_select(options, "Select session")
+        if index is None:
+            click.echo(style_dim("Cancelled."))
+            return
+
+        if index == 0:
+            # Create new session
+            name = click.prompt(
+                click.style("  Session name", fg=CYAN),
+                default=suggested,
+                prompt_suffix=" → ",
+            )
+            click.echo(style_success(f"Creating session '{name}'..."))
+            run_tmux_new(name)
+        else:
+            # Attach to selected session
+            selected = sessions[index - 1]
+            click.echo(style_info(f"Attaching to session '{selected.name}'..."))
+            run_tmux_attach(selected.name)
+        return
+
+    # No sessions - show action menu
+    options = [
+        click.style("[+] Create new session", fg=GREEN),
+        click.style("[?] List sessions", fg=CYAN),
+    ]
+
+    index = fuzzy_select(options, "No sessions found")
+    if index is None:
+        click.echo(style_dim("Cancelled."))
+        return
+
+    if index == 0:
+        # Create new session
+        name = click.prompt(
+            click.style("  Session name", fg=CYAN),
+            default=suggested,
+            prompt_suffix=" → ",
+        )
+        click.echo(style_success(f"Creating session '{name}'..."))
+        run_tmux_new(name)
+    else:
+        click.echo(style_dim("No sessions to list."))
+
+
+@cli.command()
+@click.argument("name", required=False)
+def create(name: str | None) -> None:
+    """Create a new tmux session.
+
+    If NAME is not provided, prompts with current branch name as default.
+
+    EXAMPLES:
+        tm create              # Prompt for name (default: branch name)
+        tm create my-session   # Create session named 'my-session'
+        tm c feature           # Create session named 'feature'
+    """
+    require_tmux()
+
+    if not name:
+        suggested = get_suggested_name()
+        name = click.prompt(
+            click.style("  Session name", fg=CYAN),
+            default=suggested,
+            prompt_suffix=" → ",
+        )
+
+    # Check if session already exists
+    if session_exists(name):
+        if click.confirm(
+            style_warn(f"Session '{name}' already exists. Attach to it?"),
+            default=True,
+        ):
+            click.echo(style_info(f"Attaching to session '{name}'..."))
+            run_tmux_attach(name)
+        else:
+            click.echo(style_dim("Cancelled."))
+        return
+
+    click.echo(style_success(f"Creating session '{name}'..."))
+    run_tmux_new(name)
+
+
+@cli.command()
+@click.argument("name", required=False)
+def attach(name: str | None) -> None:
+    """Attach to an existing tmux session.
+
+    If NAME is not provided, shows interactive picker.
+
+    EXAMPLES:
+        tm attach              # Interactive: pick session
+        tm attach my-session   # Attach to 'my-session'
+        tm a feature           # Attach to 'feature'
+    """
+    require_tmux()
+
+    sessions = list_sessions()
+
+    if not sessions:
+        click.echo(style_error("No tmux sessions found."), err=True)
+        if click.confirm(style_info("Create a new session?"), default=True):
+            suggested = get_suggested_name()
+            session_name = click.prompt(
+                click.style("  Session name", fg=CYAN),
+                default=suggested,
+                prompt_suffix=" → ",
+            )
+            click.echo(style_success(f"Creating session '{session_name}'..."))
+            run_tmux_new(session_name)
+        return
+
+    if name:
+        # Direct attach
+        if not session_exists(name):
+            click.echo(style_error(f"Session '{name}' not found."), err=True)
+            sys.exit(1)
+        click.echo(style_info(f"Attaching to session '{name}'..."))
+        run_tmux_attach(name)
+        return
+
+    # Interactive mode
+    if len(sessions) == 1:
+        # Only one session, attach directly
+        session = sessions[0]
+        click.echo(style_info(f"Attaching to session '{session.name}'..."))
+        run_tmux_attach(session.name)
+        return
+
+    # Multiple sessions, show picker
+    options = [format_session_option(s) for s in sessions]
+    index = fuzzy_select(options, "Select session")
+    if index is None:
+        click.echo(style_dim("Cancelled."))
+        return
+
+    selected = sessions[index]
+    click.echo(style_info(f"Attaching to session '{selected.name}'..."))
+    run_tmux_attach(selected.name)
+
+
+@cli.command("list")
+def list_cmd() -> None:
+    """List all tmux sessions.
+
+    EXAMPLES:
+        tm list
+        tm ls
+    """
+    require_tmux()
+
+    sessions = list_sessions()
+
+    if not sessions:
+        click.echo(style_dim("No tmux sessions found."))
+        return
+
+    for session in sessions:
+        name_styled = click.style(session.name, fg=CYAN, bold=True)
+        if session.attached:
+            status_styled = click.style("[attached]", fg=GREEN)
+        else:
+            status_styled = click.style("[detached]", fg=YELLOW)
+        windows_styled = click.style(f"{session.windows} windows", fg=DIM)
+        click.echo(f"  {name_styled:30} {status_styled:20} {windows_styled}")
+
+
+@cli.command()
+@click.argument("name", required=False)
+@click.option("-f", "--force", is_flag=True, help="Kill without confirmation")
+def kill(name: str | None, *, force: bool) -> None:
+    """Kill a tmux session.
+
+    If NAME is not provided, shows interactive picker.
+
+    EXAMPLES:
+        tm kill                # Interactive: pick session to kill
+        tm kill my-session     # Kill 'my-session'
+        tm k feature -f        # Force kill 'feature' without confirmation
+    """
+    require_tmux()
+
+    sessions = list_sessions()
+
+    if not sessions:
+        click.echo(style_error("No tmux sessions found."), err=True)
+        sys.exit(1)
+
+    if name:
+        # Direct kill
+        if not session_exists(name):
+            click.echo(style_error(f"Session '{name}' not found."), err=True)
+            sys.exit(1)
+
+        if not force and not click.confirm(
+            style_warn(f"Kill session '{name}'?"), default=False
+        ):
+            click.echo(style_dim("Cancelled."))
+            return
+
+        result = subprocess.run(
+            ["tmux", "kill-session", "-t", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            click.echo(style_success(f"Killed session '{name}'"))
+        else:
+            click.echo(
+                style_error(f"Failed to kill session: {result.stderr}"), err=True
+            )
+            sys.exit(1)
+        return
+
+    # Interactive mode
+    options = [format_session_option(s) for s in sessions]
+    index = fuzzy_select(options, "Select session to kill")
+    if index is None:
+        click.echo(style_dim("Cancelled."))
+        return
+
+    selected = sessions[index]
+
+    if not force and not click.confirm(
+        style_warn(f"Kill session '{selected.name}'?"), default=False
+    ):
+        click.echo(style_dim("Cancelled."))
+        return
+
+    result = subprocess.run(
+        ["tmux", "kill-session", "-t", selected.name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        click.echo(style_success(f"Killed session '{selected.name}'"))
+    else:
+        click.echo(style_error(f"Failed to kill session: {result.stderr}"), err=True)
+        sys.exit(1)
+
+
+# Short aliases for frequently used commands
+cli.add_command(create, name="c")
+cli.add_command(attach, name="a")
+cli.add_command(list_cmd, name="ls")
+cli.add_command(kill, name="k")
+
+
+if __name__ == "__main__":
+    cli()
