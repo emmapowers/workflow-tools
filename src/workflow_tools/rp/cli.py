@@ -12,8 +12,6 @@ import click
 from workflow_tools.common import (
     CYAN,
     DIM,
-    GREEN,
-    YELLOW,
     fuzzy_select,
     style_dim,
     style_error,
@@ -23,7 +21,7 @@ from workflow_tools.common import (
 )
 from workflow_tools.common.github import run_gh, run_gh_json
 from workflow_tools.common.shell import output_cd as _output_cd
-from workflow_tools.rp.discovery import RepoCache, RepoInfo
+from workflow_tools.rp.discovery import discover_repos, find_repo
 
 
 def output_cd(path: Path) -> None:
@@ -31,26 +29,15 @@ def output_cd(path: Path) -> None:
     _output_cd(path, env_var="RP_CD_FILE")
 
 
-def get_cache() -> RepoCache:
-    """Get the repo cache instance."""
-    return RepoCache()
-
-
-def format_repo_options(repos: list[RepoInfo]) -> list[str]:
-    """Format repos for display in picker (no ANSI codes - InquirerPy doesn't support them).
-
-    Returns column-aligned options with name and path.
-    """
+def format_repo_options(repos: list[Path]) -> list[str]:
+    """Format repos for picker: name + path."""
     if not repos:
         return []
-
     max_name = max(len(r.name) for r in repos)
-    options = []
-    for repo in repos:
-        name_padded = repo.name.ljust(max_name)
-        path_short = repo.path.replace(str(Path.home()), "~")
-        options.append(f"{name_padded}  {path_short}")
-    return options
+    return [
+        f"{r.name.ljust(max_name)}  {str(r).replace(str(Path.home()), '~')}"
+        for r in repos
+    ]
 
 
 def select_directory(message: str, base_paths: list[Path] | None = None) -> Path | None:
@@ -90,24 +77,19 @@ def select_directory(message: str, base_paths: list[Path] | None = None) -> Path
 
 @click.group(invoke_without_command=True)
 @click.version_option(package_name="workflow-tools")
-@click.option(
-    "--refresh", "-r", is_flag=True, help="Force cache refresh before selection"
-)
 @click.pass_context
-def cli(ctx: click.Context, *, refresh: bool) -> None:
+def cli(ctx: click.Context) -> None:
     """Repository management with fast discovery.
 
     Switch between repos, create new ones, fork, clone, and rename.
 
     EXAMPLES:
         rp                    # Interactive: pick repo to switch to
-        rp -r                 # Refresh cache first
         rp list               # List all discovered repos
         rp create my-project  # Create new GitHub repo
         rp fork owner/repo    # Fork a GitHub repo
         rp clone              # Clone one of your GitHub repos
         rp rename old new     # Rename local folder and GitHub repo
-        rp refresh            # Force refresh repo cache
 
     ALIASES:
         rp sw = rp switch
@@ -116,146 +98,75 @@ def cli(ctx: click.Context, *, refresh: bool) -> None:
         rp fk = rp fork
         rp cl = rp clone
         rp rn = rp rename
-        rp rf = rp refresh
     """
-    ctx.ensure_object(dict)
     if ctx.invoked_subcommand is None:
-        ctx.invoke(switch_cmd, refresh=refresh)
+        ctx.invoke(switch_cmd)
 
 
 @cli.command("switch")
 @click.argument("name", required=False)
-@click.option(
-    "--refresh", "-r", is_flag=True, help="Force cache refresh before selection"
-)
-def switch_cmd(name: str | None, *, refresh: bool) -> None:
+def switch_cmd(name: str | None) -> None:
     """Switch to a repository.
 
     Without NAME, shows interactive picker with fuzzy search.
-    Press Ctrl+R in the picker to refresh the repo list.
 
     EXAMPLES:
         rp                      # Interactive: pick repo
         rp switch workflow      # Switch to repo named 'workflow'
-        rp -r                   # Refresh cache first
     """
-    cache = get_cache()
-    force_refresh = refresh
+    repos = discover_repos()
+    if not repos:
+        click.echo(style_error("No repositories found"), err=True)
+        sys.exit(1)
 
     if name:
-        # Direct switch - no interactive mode
-        repos, _ = cache.get_repos(force_refresh=force_refresh, show_progress=True)
-        if not repos:
-            click.echo(style_error("No repositories found. Try 'rp refresh'"), err=True)
-            sys.exit(1)
-        repo = cache.find_repo(name)
+        repo = find_repo(name, repos)
         if not repo:
             click.echo(style_error(f"Repository '{name}' not found"), err=True)
             sys.exit(1)
-        output_cd(Path(repo.path))
+        output_cd(repo)
         return
 
-    # Interactive mode with refresh option
-    while True:
-        repos, from_cache = cache.get_repos(
-            force_refresh=force_refresh, show_progress=True
-        )
-
-        if not repos:
-            click.echo(style_error("No repositories found. Try 'rp refresh'"), err=True)
-            sys.exit(1)
-
-        options = format_repo_options(repos)
-        # Add refresh option at the top if using cache
-        if from_cache:
-            options = ["[refresh list]", *options]
-
-        index = fuzzy_select(options, "Select repository")
-
-        if index is None:
-            click.echo(style_dim("Cancelled."))
-            return
-
-        # Handle refresh option
-        if from_cache and index == 0:
-            force_refresh = True
-            continue
-
-        # Adjust index if refresh option was present
-        repo_index = index - 1 if from_cache else index
-        selected = repos[repo_index]
-        output_cd(Path(selected.path))
+    # Interactive selection
+    options = format_repo_options(repos)
+    index = fuzzy_select(options, "Select repository")
+    if index is None:
+        click.echo(style_dim("Cancelled."))
         return
+    output_cd(repos[index])
 
 
 @cli.command("list")
 @click.option("--json", "-j", "as_json", is_flag=True, help="Output as JSON")
 @click.option("--path-only", is_flag=True, help="Output just paths (one per line)")
-@click.option("--refresh", "-r", is_flag=True, help="Force cache refresh")
-def list_cmd(*, as_json: bool, path_only: bool, refresh: bool) -> None:
+def list_cmd(*, as_json: bool, path_only: bool) -> None:
     """List all discovered repositories.
 
     EXAMPLES:
         rp list               # List all repos
         rp ls --json          # JSON output
         rp ls --path-only     # Just paths for scripting
-        rp ls -r              # Refresh cache first
     """
-    cache = get_cache()
-    repos, _ = cache.get_repos(force_refresh=refresh, show_progress=True)
+    repos = discover_repos()
 
     if as_json:
-        click.echo(json.dumps([r._asdict() for r in repos], indent=2))
+        click.echo(json.dumps([str(r) for r in repos], indent=2))
         return
 
     if path_only:
-        for repo in repos:
-            click.echo(repo.path)
+        for r in repos:
+            click.echo(r)
         return
 
     if not repos:
         click.echo(style_dim("No repositories found"))
         return
 
-    # Calculate max widths for alignment
     max_name = max(len(r.name) for r in repos)
-    max_path = max(len(r.path.replace(str(Path.home()), "~")) for r in repos)
-
-    for repo in repos:
-        # Pad raw strings BEFORE styling
-        name_padded = repo.name.ljust(max_name)
-        path_short = repo.path.replace(str(Path.home()), "~")
-        path_padded = path_short.ljust(max_path)
-
-        # Now apply styling
-        name_styled = click.style(name_padded, fg=CYAN, bold=True)
-        path_styled = click.style(path_padded, fg=DIM)
-
-        remote_badge = ""
-        if repo.remote_type == "github":
-            remote_badge = click.style("[github]", fg=GREEN)
-        elif repo.remote_type == "local":
-            remote_badge = click.style("[local]", fg=YELLOW)
-        elif repo.remote_type != "other":
-            remote_badge = click.style(f"[{repo.remote_type}]", fg=DIM)
-
-        click.echo(f"  {name_styled} {path_styled} {remote_badge}")
-
-
-@cli.command()
-def refresh() -> None:
-    """Force refresh the repository cache.
-
-    Scans ~/Documents for git repositories and updates the cache.
-
-    EXAMPLES:
-        rp refresh
-        rp rf
-    """
-    cache = get_cache()
-    click.echo(style_info("Scanning for repositories..."))
-    repos, _ = cache.get_repos(force_refresh=True)
-    click.echo(style_success(f"Found {len(repos)} repositories"))
+    for r in repos:
+        name_styled = click.style(r.name.ljust(max_name), fg=CYAN, bold=True)
+        path_styled = click.style(str(r).replace(str(Path.home()), "~"), fg=DIM)
+        click.echo(f"  {name_styled} {path_styled}")
 
 
 @cli.command()
@@ -345,8 +256,6 @@ def create(
         )
 
     if clone_path.exists():
-        cache = get_cache()
-        cache.add_repo(clone_path)
         click.echo(style_success(f"Cloned to {clone_path}"))
         output_cd(clone_path)
     else:
@@ -455,8 +364,6 @@ def fork(
         )
 
     if clone_path.exists():
-        cache = get_cache()
-        cache.add_repo(clone_path)
         click.echo(style_success(f"Cloned to {clone_path}"))
         output_cd(clone_path)
     else:
@@ -490,8 +397,7 @@ def clone(repo_name: str | None, path: str | None, *, clone_all: bool) -> None:
         sys.exit(1)
 
     # Get local repos to check what's already cloned
-    cache = get_cache()
-    local_repos, _ = cache.get_repos()
+    local_repos = discover_repos()
     local_names = {r.name for r in local_repos}
 
     if repo_name:
@@ -505,9 +411,10 @@ def clone(repo_name: str | None, path: str | None, *, clone_all: bool) -> None:
             # Find path and switch to it
             for r in local_repos:
                 if r.name == repo_name:
-                    click.echo(style_info(f"'{repo_name}' already cloned at {r.path}"))
-                    output_cd(Path(r.path))
+                    click.echo(style_info(f"'{repo_name}' already cloned at {r}"))
+                    output_cd(r)
                     return
+        repos_to_clone = matching
     else:
         # Interactive selection
         options = []
@@ -516,13 +423,14 @@ def clone(repo_name: str | None, path: str | None, *, clone_all: bool) -> None:
             name = r["name"]
             desc = r.get("description", "")[:40] or ""
             if name in local_names:
-                local_path = next(
-                    (lr.path for lr in local_repos if lr.name == name), ""
-                )
-                short_path = local_path.replace(str(Path.home()), "~")
-                options.append(
-                    f"{name}  {click.style(f'[cloned: {short_path}]', fg=GREEN)}"
-                )
+                local_path = next((lr for lr in local_repos if lr.name == name), None)
+                if local_path:
+                    short_path = str(local_path).replace(str(Path.home()), "~")
+                    options.append(
+                        f"{name}  {click.style(f'[cloned: {short_path}]', fg='green')}"
+                    )
+                else:
+                    options.append(f"{name}  {click.style(desc, fg=DIM)}")
             else:
                 options.append(f"{name}  {click.style(desc, fg=DIM)}")
                 uncloned_repos.append(r)
@@ -543,8 +451,8 @@ def clone(repo_name: str | None, path: str | None, *, clone_all: bool) -> None:
                 # Switch to existing repo
                 for r in local_repos:
                     if r.name == selected["name"]:
-                        click.echo(style_info(f"Already cloned, switching to {r.path}"))
-                        output_cd(Path(r.path))
+                        click.echo(style_info(f"Already cloned, switching to {r}"))
+                        output_cd(r)
                         return
             repos_to_clone = [selected]
 
@@ -561,28 +469,27 @@ def clone(repo_name: str | None, path: str | None, *, clone_all: bool) -> None:
 
     # Clone the repos
     for repo in repos_to_clone:
-        repo_name = repo["name"]
-        clone_path = dest_dir / repo_name
+        name = repo["name"]
+        clone_path = dest_dir / name
 
         if clone_path.exists():
-            click.echo(style_warn(f"Skipping {repo_name}: directory already exists"))
+            click.echo(style_warn(f"Skipping {name}: directory already exists"))
             continue
 
-        click.echo(style_info(f"Cloning {repo_name}..."))
+        click.echo(style_info(f"Cloning {name}..."))
 
         # Clone via gh (handles SSH/HTTPS automatically)
         result = subprocess.run(
-            ["gh", "repo", "clone", repo_name, str(clone_path)],
+            ["gh", "repo", "clone", name, str(clone_path)],
             check=False,
             capture_output=True,
             text=True,
         )
 
         if result.returncode == 0 and clone_path.exists():
-            cache.add_repo(clone_path)
-            click.echo(style_success(f"Cloned {repo_name} to {clone_path}"))
+            click.echo(style_success(f"Cloned {name} to {clone_path}"))
         else:
-            click.echo(style_error(f"Failed to clone {repo_name}"), err=True)
+            click.echo(style_error(f"Failed to clone {name}"), err=True)
 
     # If single repo cloned, cd to it
     if len(repos_to_clone) == 1:
@@ -606,8 +513,10 @@ def rename(
         rp rename old-name new-name --local-only   # Local only
         rp rename old-name new-name --github-only  # GitHub only
     """
-    cache = get_cache()
-    repo = cache.find_repo(old_name)
+    repos = discover_repos()
+    repo = find_repo(old_name, repos)
+    old_path: Path | None = None
+    new_path: Path | None = None
 
     if not github_only:
         if not repo:
@@ -616,7 +525,7 @@ def rename(
             )
             sys.exit(1)
 
-        old_path = Path(repo.path)
+        old_path = repo
         new_path = old_path.parent / new_name
 
         if new_path.exists():
@@ -626,8 +535,6 @@ def rename(
         # Rename local directory
         click.echo(style_info(f"Renaming {old_path} → {new_path}"))
         old_path.rename(new_path)
-        cache.remove_repo(old_path)
-        cache.add_repo(new_path)
         click.echo(style_success("Renamed local directory"))
 
     if not local_only:
@@ -638,19 +545,16 @@ def rename(
         result = run_gh("repo", "rename", new_name, "-y")
         if result is None:
             click.echo(style_error("Failed to rename on GitHub"), err=True)
-            if not github_only:
+            if not github_only and old_path and new_path:
                 # Revert local rename
                 new_path.rename(old_path)
-                cache.remove_repo(new_path)
-                cache.add_repo(old_path)
                 click.echo(style_warn("Reverted local rename"))
             sys.exit(1)
 
         click.echo(style_success("Renamed on GitHub"))
 
         # Update git remote URL if we renamed locally
-        if not github_only:
-            new_path = old_path.parent / new_name
+        if not github_only and new_path:
             viewer = run_gh("api", "user", "--jq", ".login")
             if viewer:
                 new_url = f"git@github.com:{viewer.strip()}/{new_name}.git"
@@ -662,7 +566,7 @@ def rename(
                 )
                 click.echo(style_info(f"Updated remote URL to {new_url}"))
 
-    if not github_only:
+    if not github_only and new_path:
         output_cd(new_path)
 
 
@@ -673,7 +577,6 @@ cli.add_command(create, name="cr")
 cli.add_command(fork, name="fk")
 cli.add_command(clone, name="cl")
 cli.add_command(rename, name="rn")
-cli.add_command(refresh, name="rf")
 
 
 if __name__ == "__main__":

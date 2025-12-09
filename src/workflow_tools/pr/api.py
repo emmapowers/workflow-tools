@@ -353,7 +353,9 @@ def get_pending_review(
     if not result:
         return None
 
-    reviews = result.get("data", {}).get("node", {}).get("reviews", {}).get("nodes", [])
+    reviews: list[dict[str, Any]] = (
+        result.get("data", {}).get("node", {}).get("reviews", {}).get("nodes", [])
+    )
     for review in reviews:
         if (
             viewer_login is None
