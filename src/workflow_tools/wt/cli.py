@@ -262,7 +262,7 @@ def cli(ctx: click.Context) -> None:
         wt create           # Interactive: create new worktree
         wt create foo       # Create worktree named 'foo'
         wt pr               # Create worktree from GitHub PR
-        wt fork             # Create worktree with new branch
+        wt fork feature     # Create new branch 'feature' in worktree
         wt list             # List all worktrees
         wt remove foo       # Remove worktree 'foo'
         wt remove .         # Remove current worktree
@@ -439,23 +439,27 @@ def pr_cmd(name: str | None) -> None:
 
 
 @cli.command()
-@click.argument("name", required=False)
-def fork(name: str | None) -> None:
+@click.argument("branch", required=False)
+def fork(branch: str | None) -> None:
     """Create worktree with a new branch.
 
-    Prompts for branch name, then base branch (defaults to current HEAD).
+    Takes the branch name as argument (or prompts if not provided).
+    Worktree name defaults to the branch name.
 
     EXAMPLES:
-        wt fork              # Interactive: create new branch
-        wt fork feature      # Create worktree named 'feature'
+        wt fork              # Interactive: prompt for branch name
+        wt fork feat/login   # Branch 'feat/login' in worktree 'feat-login'
     """
     repo_root = require_repo()
 
-    # Prompt for new branch name
-    new_branch = click.prompt(
-        click.style("  New branch name", fg=CYAN),
-        prompt_suffix=" → ",
-    )
+    # Get branch name (from argument or prompt)
+    if branch:
+        new_branch = branch
+    else:
+        new_branch = click.prompt(
+            click.style("  New branch name", fg=CYAN),
+            prompt_suffix=" → ",
+        )
 
     # Prompt for base branch (default to HEAD)
     base = prompt_fork_base(repo_root)
@@ -463,14 +467,13 @@ def fork(name: str | None) -> None:
         click.echo(style_dim("Cancelled."))
         return
 
-    # Prompt for worktree name
-    if not name:
-        suggested = new_branch.replace("/", "-")
-        name = click.prompt(
-            click.style("  Worktree name", fg=CYAN),
-            default=suggested,
-            prompt_suffix=" → ",
-        )
+    # Default worktree name to branch name (sanitized)
+    suggested = new_branch.replace("/", "-")
+    name = click.prompt(
+        click.style("  Worktree name", fg=CYAN),
+        default=suggested,
+        prompt_suffix=" → ",
+    )
 
     # Validate worktree name
     try:
