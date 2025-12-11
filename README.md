@@ -24,13 +24,14 @@ wt                  # Interactive picker to switch worktrees
 wt create           # Interactive branch picker
 wt create <name> -b <branch>
 wt pr               # Create worktree from open PR
-wt fork <name>      # Fork from current branch
+wt fork <branch>    # Create new branch in worktree
 wt list             # List worktrees
 wt remove           # Interactive picker
 wt remove <name>    # Remove specific worktree
+wt remove .         # Remove current worktree
+wt cleanup          # Remove current worktree + delete branch
 wt claude           # Open Claude Code in worktree
 wt path <name>      # Print worktree path
-wt cleanup          # Remove current worktree and switch to main
 ```
 
 Aliases: `cr`, `sw`, `ls`, `rm`, `fk`, `c`
